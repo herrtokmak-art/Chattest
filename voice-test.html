@@ -43,9 +43,9 @@
 <div class="card">
   <label>Deepgram API key (STT)</label>
   <input id="dgKey" type="password" placeholder="Deepgram key" autocomplete="off">
-  <label>Inworld API key (TTS)</label>
-  <input id="iwKey" type="password" placeholder="Inworld key (the value you put after 'Basic ')" autocomplete="off">
-  <div class="hint">Paste the <b>Base64 (Basic)</b> credential from the Inworld portal — just the long string, without the word "Basic". Sent as an HTTPS request header (no WebSocket/JWT needed). Note: this credential is visible in the page's network tab, which is fine for a private test on your own phone — rotate it afterward.</div>
+  <label>TTS relay URL (your Cloudflare Worker)</label>
+  <input id="relayUrl" type="text" placeholder="https://inworld-tts.your-name.workers.dev" autocomplete="off">
+  <div class="hint">Your Inworld key now lives on the <b>relay</b> (the Cloudflare Worker), not here — see DEPLOY-WORKER.md. Paste the Worker's URL above. The browser calls the relay; the relay calls Inworld server-side. This fixes the CORS block and keeps your Inworld key off the device.</div>
   <label>OpenRouter API key (LLM)</label>
   <input id="orKey" type="password" placeholder="OpenRouter key" autocomplete="off">
 
@@ -67,12 +67,18 @@
     </div>
     <div>
       <label>Inworld TTS model</label>
-      <input id="iwModel" value="inworld-tts-2">
+      <input id="iwModel" value="inworld-tts-1.5-max">
+      <div class="hint">1.5-max = safe GA · 1.5-mini = fastest · inworld-tts-2 = newest (needs Standard key access)</div>
     </div>
   </div>
 
   <label>Character instructions (the "call payload" — hardcoded for this test)</label>
   <textarea id="sysPrompt">You are Alev, an old friend of Emre, talking to him on the phone. Speak naturally, warmly, in short spoken sentences — this is a voice call, not text. No narration, no asterisks, no stage directions. Reply in the SAME language Emre speaks. You may use Inworld emotion tags in square brackets at the START of a sentence to colour your delivery, e.g. [happy], [whispers], [laughs], [sighs]. Keep replies to 1–3 sentences so the conversation flows.</textarea>
+
+  <div class="controls" style="margin-top:8px">
+    <button id="iwTestBtn" class="sec" style="font-size:13px;padding:9px 13px">🔍 Test relay</button>
+    <span class="hint" style="margin:0">Checks your Cloudflare relay is live + the key works — one tiny synth. Run this before a full call.</span>
+  </div>
 
   <details>
     <summary>Advanced (turn-taking · car tuning)</summary>
@@ -80,7 +86,11 @@
       <div><label>endpointing (ms silence → finalize)</label><input id="dgEndpoint" value="400"></div>
       <div><label>utterance_end_ms</label><input id="dgUttEnd" value="1200"></div>
     </div>
-    <div class="hint">In a noisy car, raise these if it cuts you off mid-sentence; lower them if it feels slow to respond.</div>
+    <div class="row">
+      <div><label>barge-in min chars (real words to interrupt)</label><input id="bargeMin" value="3"></div>
+      <div><label>barge-in guard ms (after char starts)</label><input id="bargeGuard" value="700"></div>
+    </div>
+    <div class="hint">Endpointing: raise if it cuts you off mid-sentence; lower if slow to respond. Barge-in: raise <b>min chars</b> / <b>guard ms</b> if the character keeps interrupting ITSELF (its own voice echoing back through the speaker). On speakerphone in a car, try min 5 / guard 1200.</div>
   </details>
 </div>
 
@@ -132,7 +142,12 @@ $('clearLog').onclick=()=>logEl.innerHTML='';
 
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const DG_BASE = "wss://api.deepgram.com/v1/listen";
-/* Inworld TTS uses HTTP streaming (IW_TTS_HTTP, defined below) — no WebSocket. */
+/* Inworld TTS is reached through your Cloudflare relay (relayUrl()), not directly. */
+
+// ---- barge-in tuning (defaults; overridable from the Advanced UI) ----
+let BARGE_MIN_CHARS = 3;     // need at least this many non-space chars of real transcript to interrupt
+let BARGE_GUARD_MS  = 700;   // ignore "user speech" for this long after the character starts talking
+                             // (lets the character's own first syllable / echo pass without self-cutting)
 
 // ---- runtime state for one call ----
 let call = null;
@@ -153,6 +168,8 @@ function freshCall(){
     // turn bookkeeping
     speaking:false,          // TTS currently producing/playing audio for a reply
     generating:false,        // an OpenRouter stream is in flight
+    speakStartedAt:0,        // perf time the character began speaking (barge-in guard)
+    _vadVerbose:false,
     turnSeq:0,
     startedAt:0, durTimer:null, turns:0, bargeIns:0
   };
@@ -247,10 +264,13 @@ function startDeepgram(){
   };
   ws.onmessage = (ev)=>{
     let m; try{ m=JSON.parse(ev.data); }catch(e){ return; }
-    // VAD: user started speaking → candidate barge-in
+    // VAD SpeechStarted: NO LONGER an immediate barge-in. On speakerphone the
+    // character's OWN voice (and road noise) trips this constantly and would cut
+    // every reply. We now barge in only on a CONFIRMED interim transcript (real
+    // words) past a short guard window — see the Results branch below. Keep this
+    // as a quiet breadcrumb only.
     if(m.type==='SpeechStarted'){
-      log('DG SpeechStarted', 'l-evt');
-      if(call.speaking || call.generating){ bargeIn('user spoke'); }
+      if(call._vadVerbose) log('DG SpeechStarted (vad)', 'l-evt');
       return;
     }
     if(m.type==='UtteranceEnd'){
@@ -261,6 +281,18 @@ function startDeepgram(){
       const alt = m.channel && m.channel.alternatives && m.channel.alternatives[0];
       const txt = alt && alt.transcript ? alt.transcript : '';
       if(!txt){ return; }
+
+      // ---- CONFIRMED-SPEECH BARGE-IN ----
+      // Only interrupt the character if we have actual recognised WORDS (not a bare
+      // VAD blip), they total at least BARGE_MIN_CHARS, and we're past a guard window
+      // after the character began speaking (so its own first syllable can't self-cut).
+      if((call.speaking || call.generating) && txt.replace(/\s/g,'').length >= BARGE_MIN_CHARS){
+        const sinceSpeak = performance.now() - (call.speakStartedAt||0);
+        if(sinceSpeak >= BARGE_GUARD_MS){
+          bargeIn('user words: "'+txt.slice(0,40)+'"');
+        }
+      }
+
       if(m.is_final){
         // accumulate finals until speech_final (end of turn)
         call._finalBuf = ((call._finalBuf||'')+' '+txt).trim();
@@ -406,18 +438,21 @@ function makeChunker(emit){
 /* Ordering: each sentence is queued; we synthesize them one at a time so    */
 /* audio for sentence N fully enqueues before sentence N+1 starts.           */
 /* ----------------------------------------------------------------------- */
-const IW_TTS_HTTP = "https://api.inworld.ai/tts/v1/voice:stream";
+// TTS now goes through YOUR Cloudflare relay (it adds the Inworld key + CORS).
+// The browser sends only the synthesis body; no Authorization header here.
+function relayUrl(){ return ($('relayUrl').value||'').trim().replace(/\/+$/,''); }
 
 function startInworldTTS(){
-  // Nothing to connect — HTTP is stateless. Just validate the key is present.
-  const key = $('iwKey').value.trim();
-  if(!key){ log('No Inworld key (TTS will fail)', 'l-err'); return; }
+  // Stateless — just confirm the relay URL is set.
+  const u = relayUrl();
+  if(!u){ log('No TTS relay URL set (deploy the Cloudflare Worker, paste its URL)', 'l-err'); return; }
   call.iwReady = true;
-  log('IW TTS ready (HTTP streaming, Basic auth)', 'l-ok');
+  log('TTS ready via relay · '+u, 'l-ok');
 }
 
 function ttsBeginReply(turn){
   call.speaking=true; setStatus('Speaking…','speak');
+  call.speakStartedAt = performance.now();   // start of the barge-in guard window
   // reset this reply's synth queue
   call.ttsQueue = [];
   call.ttsBusy = false;
@@ -445,8 +480,8 @@ async function pumpTtsQueue(){
   try{
     await synthOneHttp(item.text, item.turn);
   }catch(e){
-    if(e.name==='AbortError'){ log('IW synth aborted (barge-in)', 'l-evt'); }
-    else{ log('IW synth error: '+e.message, 'l-err'); console.error(e); }
+    if(e.name==='AbortError'){ log('TTS synth aborted (barge-in)', 'l-evt'); }
+    else{ log('TTS synth error: '+e.message, 'l-err'); console.error(e); }
   }finally{
     call.ttsBusy = false;
     // continue draining if more queued and still the same turn
@@ -455,9 +490,10 @@ async function pumpTtsQueue(){
 }
 
 async function synthOneHttp(text, turn){
-  const key   = $('iwKey').value.trim();
+  const u     = relayUrl();
   const voice = $('iwVoice').value.trim() || 'Dennis';
-  const model = $('iwModel').value.trim() || 'inworld-tts-2';
+  const model = $('iwModel').value.trim() || 'inworld-tts-1.5-max';
+  if(!u){ log('TTS synth: no relay URL', 'l-err'); return; }
   const body = {
     text,
     voiceId: voice,
@@ -468,15 +504,15 @@ async function synthOneHttp(text, turn){
   // share the barge-in AbortController so an interrupt kills in-flight synth too
   const ctrl = call.orAbort || new AbortController();
   call.ttsAbort = ctrl;
-  const res = await fetch(IW_TTS_HTTP, {
+  const res = await fetch(u, {
     method:'POST',
-    headers:{ 'Authorization':'Basic '+key, 'Content-Type':'application/json' },
+    headers:{ 'Content-Type':'application/json' },   // relay adds the Inworld auth
     body: JSON.stringify(body),
     signal: ctrl.signal
   });
   if(!res.ok){
     const tx = await res.text().catch(()=> '');
-    log('IW HTTP '+res.status+(tx? ' · '+tx.slice(0,200):''), 'l-err');
+    log('TTS relay HTTP '+res.status+(tx? ' · '+tx.slice(0,200):''), 'l-err');
     return;
   }
   // The streamed body is newline-delimited JSON objects: { result:{ audioContent, usage } }
@@ -576,6 +612,9 @@ async function startCall(){
   if(call && call.active) return;
   call = freshCall();
   history.length = 0;
+  // pull barge-in tuning from the Advanced panel
+  BARGE_MIN_CHARS = Math.max(1, parseInt($('bargeMin').value)||3);
+  BARGE_GUARD_MS  = Math.max(0, parseInt($('bargeGuard').value)||700);
   $('startBtn').disabled=true; $('stopBtn').disabled=false;
   setStatus('Connecting…','think');
   log('=== CALL START ===','l-ok');
@@ -642,6 +681,67 @@ function endCall(){
 
 $('startBtn').onclick = startCall;
 $('stopBtn').onclick = endCall;
+
+// ---- one-shot Inworld key test (isolates auth from the whole pipeline) ----
+$('iwTestBtn').onclick = async ()=>{
+  const u     = relayUrl();
+  const voice = $('iwVoice').value.trim() || 'Ashley';
+  const model = $('iwModel').value.trim() || 'inworld-tts-1.5-max';
+  if(!u){ log('TEST: paste your relay URL first (deploy the Cloudflare Worker)', 'l-err'); return; }
+
+  // 1) health check (GET) — confirms the worker is live and the key secret is set
+  log('TEST → relay health check…', 'l-tts');
+  try{
+    const h = await fetch(u, { method:'GET' });
+    const hj = await h.json().catch(()=> ({}));
+    if(hj && hj.ok){
+      log('   relay live · keyConfigured='+(hj.keyConfigured?'yes ✓':'NO ✗'), hj.keyConfigured?'l-ok':'l-err');
+      if(!hj.keyConfigured){ log('   → Add the INWORLD_KEY secret on the Worker (see DEPLOY-WORKER.md), then retry.', 'l-err'); return; }
+    }else{
+      log('   relay responded but not as expected: '+JSON.stringify(hj).slice(0,160), 'l-err');
+    }
+  }catch(e){
+    log('TEST: relay UNREACHABLE — "'+e.message+'". Check the URL, and that the Worker is deployed.', 'l-err');
+    return;
+  }
+
+  // 2) real synth (POST) through the relay
+  log('TEST → synth via relay · '+model+' / voice "'+voice+'" …', 'l-tts');
+  let res;
+  try{
+    res = await fetch(u, {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json' },
+      body: JSON.stringify({ text:'Test.', voiceId:voice, modelId:model,
+        audioConfig:{ audioEncoding:'LINEAR16', sampleRateHertz:24000 } })
+    });
+  }catch(e){
+    log('TEST: relay POST failed — "'+e.message+'" (network/CORS to the relay itself)', 'l-err');
+    return;
+  }
+  if(!res.ok){
+    const tx = await res.text().catch(()=> '');
+    log('TEST FAILED · HTTP '+res.status+' · '+tx.slice(0,260), 'l-err');
+    if(res.status===403){
+      log('   403 from Inworld (via relay): the INWORLD_KEY is rejected — likely a Realtime-only', 'l-err');
+      log('   key. Generate a STANDARD key in the portal and update the Worker secret.', 'l-err');
+    }
+    return;
+  }
+  // read a little of the NDJSON stream to confirm audio comes back
+  try{
+    const reader = res.body.getReader(); const dec = new TextDecoder();
+    let buf='', audioBytes=0, lines=0;
+    for(let i=0;i<6;i++){
+      const {done,value}=await reader.read(); if(done)break;
+      buf += dec.decode(value,{stream:true});
+      let nl; while((nl=buf.indexOf('\n'))>=0){ const ln=buf.slice(0,nl).trim(); buf=buf.slice(nl+1);
+        if(!ln)continue; lines++; try{ const j=JSON.parse(ln); const a=(j.result||j).audioContent; if(a)audioBytes+=atob(a).length; }catch(e){} }
+    }
+    try{ reader.cancel(); }catch(e){}
+    log('TEST OK ✓ · '+lines+' chunk(s), ~'+audioBytes+' audio bytes through the relay. Voice works!', 'l-ok');
+  }catch(e){ log('IW TEST: response began but stream read failed: '+e.message, 'l-err'); }
+};
 
 // surface uncaught errors into the log
 window.addEventListener('error', e=>{ log('JS error: '+e.message,'l-err'); });
