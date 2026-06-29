@@ -291,8 +291,15 @@ function startDeepgram(){
       return;
     }
     if(m.type==='UtteranceEnd'){
+      // Deepgram detected the user paused. In a quiet room speech_final usually
+      // fires and commits the turn; but in a NOISY CAR speech_final often never
+      // comes, so the finished sentence would sit in the buffer until much later
+      // (several sentences merging into one late transcript — the "no response,
+      // then a delayed combined response" symptom). UtteranceEnd is Deepgram's
+      // intended fallback: commit whatever finals we've accumulated, now.
       log('DG UtteranceEnd', 'l-evt');
-      return; // we rely on speech_final / is_final below to grab the transcript
+      commitUserTurn('utterance-end');
+      return;
     }
     if(m.type==='Results' || m.channel){
       const alt = m.channel && m.channel.alternatives && m.channel.alternatives[0];
@@ -311,7 +318,7 @@ function startDeepgram(){
       }
 
       if(m.is_final){
-        // accumulate finals until speech_final (end of turn)
+        // accumulate finals until a commit (speech_final OR UtteranceEnd)
         call._finalBuf = ((call._finalBuf||'')+' '+txt).trim();
         $('liveTranscript').textContent = call._finalBuf;
       }else{
@@ -319,14 +326,24 @@ function startDeepgram(){
         $('liveTranscript').textContent = ((call._finalBuf||'')+' '+txt).trim();
       }
       if(m.speech_final){
-        const full = (call._finalBuf||txt).trim();
-        call._finalBuf='';
-        if(full){ log('USER: '+full, 'l-user'); onUserTurn(full); }
+        commitUserTurn('speech-final');
       }
     }
   };
   ws.onerror = (e)=>{ log('DG error (see console)', 'l-err'); console.error('DG error', e); };
   ws.onclose = (e)=>{ log('DG closed · code '+e.code+(e.reason?' · '+e.reason:''), 'l-evt'); };
+}
+
+// Commit the accumulated final transcript as one user turn. Called by BOTH
+// speech_final (clean end) AND UtteranceEnd (noisy-car fallback). Guards against
+// double-commit: whichever fires first consumes the buffer; the other sees it empty.
+function commitUserTurn(why){
+  const full = (call._finalBuf||'').trim();
+  if(!full) return;                 // nothing buffered (the other trigger already took it)
+  call._finalBuf='';
+  $('liveTranscript').textContent='';
+  log('USER: '+full+'  ('+why+')', 'l-user');
+  onUserTurn(full);
 }
 
 /* ----------------------------------------------------------------------- */
