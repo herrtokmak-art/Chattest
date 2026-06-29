@@ -67,8 +67,15 @@
     </div>
     <div>
       <label>Inworld TTS model</label>
-      <input id="iwModel" value="inworld-tts-1.5-max">
-      <div class="hint">1.5-max = safe GA · 1.5-mini = fastest · inworld-tts-2 = newest (needs Standard key access)</div>
+      <input id="iwModel" value="inworld-tts-2">
+      <div class="hint">For Turkish use <b>inworld-tts-2</b> (Turkish is experimental-tier, only on this model). 1.5-max/1.5-mini are English-GA only.</div>
+    </div>
+  </div>
+  <div class="row">
+    <div>
+      <label>TTS language (BCP-47)</label>
+      <input id="iwLang" value="tr-TR">
+      <div class="hint">Tells Inworld the target language. tr-TR = Turkish.</div>
     </div>
   </div>
 
@@ -492,7 +499,8 @@ async function pumpTtsQueue(){
 async function synthOneHttp(text, turn){
   const u     = relayUrl();
   const voice = $('iwVoice').value.trim() || 'Dennis';
-  const model = $('iwModel').value.trim() || 'inworld-tts-1.5-max';
+  const model = $('iwModel').value.trim() || 'inworld-tts-2';
+  const lang  = ($('iwLang').value||'').trim();
   if(!u){ log('TTS synth: no relay URL', 'l-err'); return; }
   const body = {
     text,
@@ -501,6 +509,7 @@ async function synthOneHttp(text, turn){
     audioConfig: { audioEncoding:'LINEAR16', sampleRateHertz:24000 },
     deliveryMode: 'CREATIVE'    // inworld-tts-2: max emotional range for [bracket] tags
   };
+  if(lang) body.language = lang;   // BCP-47, e.g. tr-TR — improves Turkish pronunciation + normalization
   // share the barge-in AbortController so an interrupt kills in-flight synth too
   const ctrl = call.orAbort || new AbortController();
   call.ttsAbort = ctrl;
@@ -706,14 +715,17 @@ $('iwTestBtn').onclick = async ()=>{
   }
 
   // 2) real synth (POST) through the relay
-  log('TEST → synth via relay · '+model+' / voice "'+voice+'" …', 'l-tts');
+  const lang = ($('iwLang').value||'').trim();
+  log('TEST → synth via relay · '+model+' / voice "'+voice+'"'+(lang?' / '+lang:'')+' …', 'l-tts');
   let res;
   try{
+    const tbody = { text:'Merhaba, nasılsın?', voiceId:voice, modelId:model,
+        audioConfig:{ audioEncoding:'LINEAR16', sampleRateHertz:24000 } };
+    if(lang) tbody.language = lang;
     res = await fetch(u, {
       method:'POST',
       headers:{ 'Content-Type':'application/json' },
-      body: JSON.stringify({ text:'Test.', voiceId:voice, modelId:model,
-        audioConfig:{ audioEncoding:'LINEAR16', sampleRateHertz:24000 } })
+      body: JSON.stringify(tbody)
     });
   }catch(e){
     log('TEST: relay POST failed — "'+e.message+'" (network/CORS to the relay itself)', 'l-err');
