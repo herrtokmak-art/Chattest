@@ -183,9 +183,11 @@ function freshCall(){
     // playback
     playCtx:null, playQueue:[], playing:false, nextStartTime:0, activeSources:[],
     // turn bookkeeping
-    speaking:false,          // TTS currently producing/playing audio for a reply
+    speaking:false,          // a reply is in progress (generating and/or audio)
+    audioPlaying:false,      // TRUE only while real audio is actually playing (barge-in gate)
+    audioStartedAt:0,        // perf time the first audio of this reply started (guard window)
     generating:false,        // an OpenRouter stream is in flight
-    speakStartedAt:0,        // perf time the character began speaking (barge-in guard)
+    speakStartedAt:0,        // (legacy) kept for status; not the barge-in anchor anymore
     _vadVerbose:false,
     turnSeq:0,
     startedAt:0, durTimer:null, turns:0, bargeIns:0
@@ -275,6 +277,7 @@ function startDeepgram(){
 
   ws.onopen = ()=>{
     log('DG open', 'l-ok');
+    call._dgRetries = 0;   // healthy connection → reset reconnect backoff
     // KeepAlive so the socket doesn't close during silence
     call.dgKeepAlive = setInterval(()=>{ try{ ws.readyState===1 && ws.send(JSON.stringify({type:'KeepAlive'})); }catch(e){} }, 5000);
     setStatus('Listening…', 'live');
@@ -307,11 +310,16 @@ function startDeepgram(){
       if(!txt){ return; }
 
       // ---- CONFIRMED-SPEECH BARGE-IN ----
-      // Only interrupt the character if we have actual recognised WORDS (not a bare
-      // VAD blip), they total at least BARGE_MIN_CHARS, and we're past a guard window
-      // after the character began speaking (so its own first syllable can't self-cut).
-      if((call.speaking || call.generating) && txt.replace(/\s/g,'').length >= BARGE_MIN_CHARS){
-        const sinceSpeak = performance.now() - (call.speakStartedAt||0);
+      // Interrupt ONLY when the character is actually SPEAKING (audio playing).
+      // We deliberately do NOT barge in while it's merely GENERATING (thinking):
+      // if you're still finishing your own sentence, those extra words belong to
+      // the SAME turn — aborting then would kill the very reply being made for you,
+      // producing the "I keep talking and get no response" freeze. Once real audio
+      // is playing, your words are a genuine interruption.
+      // Also require: real WORDS (≥ BARGE_MIN_CHARS) and past the guard window
+      // after speech began (so the character's own first syllable can't self-cut).
+      if(call.audioPlaying && txt.replace(/\s/g,'').length >= BARGE_MIN_CHARS){
+        const sinceSpeak = performance.now() - (call.audioStartedAt||0);
         if(sinceSpeak >= BARGE_GUARD_MS){
           bargeIn('user words: "'+txt.slice(0,40)+'"');
         }
@@ -331,7 +339,24 @@ function startDeepgram(){
     }
   };
   ws.onerror = (e)=>{ log('DG error (see console)', 'l-err'); console.error('DG error', e); };
-  ws.onclose = (e)=>{ log('DG closed · code '+e.code+(e.reason?' · '+e.reason:''), 'l-evt'); };
+  ws.onclose = (e)=>{
+    log('DG closed · code '+e.code+(e.reason?' · '+e.reason:''), 'l-evt');
+    if(call.dgKeepAlive){ clearInterval(call.dgKeepAlive); call.dgKeepAlive=null; }
+    // AUTO-RECONNECT: in a moving car the cellular link drops (code 1006/1011).
+    // If the call is still active and we didn't close on purpose, reopen the STT
+    // socket after a short backoff so a dead-zone blip doesn't end the call.
+    if(call.active && !call._dgClosing){
+      call._dgRetries = (call._dgRetries||0)+1;
+      if(call._dgRetries<=5){
+        const wait = Math.min(3000, 500*call._dgRetries);
+        log('DG reconnecting (try '+call._dgRetries+') in '+wait+'ms…', 'l-evt');
+        setTimeout(()=>{ if(call.active && !call._dgClosing) startDeepgram(); }, wait);
+      }else{
+        log('DG reconnect gave up after 5 tries — end and restart the call when you have signal.', 'l-err');
+        setStatus('Lost connection','err');
+      }
+    }
+  };
 }
 
 // Commit the accumulated final transcript as one user turn. Called by BOTH
@@ -423,28 +448,27 @@ async function onUserTurn(userText){
 function cleanupGen(){ call.generating=false; call.orAbort=null; if(!call.speaking && call.active) setStatus('Listening…','live'); }
 
 /* ----------------------------------------------------------------------- */
-/* CHUNKER — fast first chunk, then per-sentence; never split inside [..]   */
+/* CHUNKER — emits ONE COMPLETE SENTENCE at a time; never splits inside [..] */
+/* and never breaks on a comma, so the voice never stops mid-sentence.       */
 /* ----------------------------------------------------------------------- */
 function makeChunker(emit){
   let buf='';
-  let firstDone=false;
   let bracketDepth=0;
-  const FIRST_MIN=12;          // emit first chunk as soon as we have a clause this long + a break
   function inBracket(){ return bracketDepth>0; }
-  // Return the index just past the first sentence/clause boundary that is NOT
-  // inside a [bracketed] instruction, or -1. `firstPass` allows lighter punctuation
-  // (the fast first chunk). A boundary char inside [...] is ignored, so a comma in
-  // "[say warmly, softly] Hi." never splits the instruction.
-  function boundaryEnd(s, firstPass){
-    const isBoundary = firstPass ? /[.!?…;:,]/ : /[.!?…]/;
+  // Return the index just past the first SENTENCE boundary (. ! ? …) that is NOT
+  // inside a [bracketed] instruction, or -1. We deliberately do NOT break on commas
+  // or colons: every emitted chunk is a COMPLETE sentence, so the voice never stops
+  // mid-thought. (A boundary char inside [...] is ignored, so a comma in
+  // "[say warmly, softly] Hi." never counts.)
+  function boundaryEnd(s){
     let depth=0;
     for(let i=0;i<s.length;i++){
       const ch=s[i];
       if(ch==='[') depth++;
       else if(ch===']'){ if(depth>0) depth--; continue; }
       if(depth>0) continue;                       // inside a bracket → never a boundary
-      if(isBoundary.test(ch)){
-        // require end-of-string or whitespace right after, like the old regex
+      if(ch==='.'||ch==='!'||ch==='?'||ch==='…'){
+        // sentence end: require end-of-string or whitespace right after
         if(i+1>=s.length || /\s/.test(s[i+1])) return i+1;
       }
     }
@@ -454,14 +478,8 @@ function makeChunker(emit){
     if(inBracket() && !force) return;             // still mid-instruction; wait for ]
     let s=buf.trim();
     if(!s) { if(force) buf=''; return; }
-    if(force){ emit(s); buf=''; return; }
-    if(!firstDone){
-      // fast first chunk: first clause boundary once we have FIRST_MIN chars
-      const end = boundaryEnd(s, true);
-      if(end>0 && s.slice(0,end).trim().length>=FIRST_MIN){ emit(s.slice(0,end).trim()); buf=s.slice(end); firstDone=true; }
-      return;
-    }
-    const end = boundaryEnd(s, false);
+    if(force){ emit(s); buf=''; return; }         // flush: speak whatever's left (final partial)
+    const end = boundaryEnd(s);
     if(end>0){ emit(s.slice(0,end).trim()); buf=s.slice(end); }
   }
   return {
@@ -504,7 +522,9 @@ function startInworldTTS(){
 
 function ttsBeginReply(turn){
   call.speaking=true; setStatus('Speaking…','speak');
-  call.speakStartedAt = performance.now();   // start of the barge-in guard window
+  call.audioPlaying=false;          // no real audio yet — barge-in stays OFF until sound plays
+  call.audioStartedAt=0;
+  call.speakStartedAt = performance.now();
   // reset this reply's synth queue
   call.ttsQueue = [];
   call.ttsBusy = false;
@@ -625,11 +645,16 @@ function enqueuePcm(arrBuf){
   srcNode.start(startAt);
   call.nextStartTime = startAt + buffer.duration;
   call.activeSources.push(srcNode);
+  if(!call.audioPlaying){ call.audioStartedAt = performance.now(); }  // first sound of this reply → guard window start
+  call.audioPlaying = true;   // real audio is now scheduled/playing → barge-in may fire
   srcNode.onended = ()=>{
     call.activeSources = call.activeSources.filter(s=>s!==srcNode);
-    if(call.activeSources.length===0 && !call.generating){
-      call.speaking=false;
-      if(call.active) setStatus('Listening…','live');
+    if(call.activeSources.length===0){
+      call.audioPlaying = false;
+      if(!call.generating){
+        call.speaking=false;
+        if(call.active) setStatus('Listening…','live');
+      }
     }
   };
 }
@@ -638,6 +663,7 @@ function stopAllPlayback(){
   call.activeSources=[];
   if(call.playCtx){ call.nextStartTime=call.playCtx.currentTime; }
   call.speaking=false;
+  call.audioPlaying=false;
 }
 
 /* ----------------------------------------------------------------------- */
