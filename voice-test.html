@@ -80,7 +80,17 @@
   </div>
 
   <label>Character instructions (the "call payload" — hardcoded for this test)</label>
-  <textarea id="sysPrompt">You are Alev, an old friend of Emre, talking to him on the phone. Speak naturally, warmly, in short spoken sentences — this is a voice call, not text. No narration, no asterisks, no stage directions. Reply in the SAME language Emre speaks. You may use Inworld emotion tags in square brackets at the START of a sentence to colour your delivery, e.g. [happy], [whispers], [laughs], [sighs]. Keep replies to 1–3 sentences so the conversation flows.</textarea>
+  <textarea id="sysPrompt">You are Alev, an old friend of Emre, talking to him on the phone. Speak naturally and warmly in short spoken sentences — this is a voice call, not text. No narration, no asterisks, no stage directions. Reply in the SAME language Emre speaks (Turkish if he speaks Turkish).
+
+VOICE DELIVERY (steering) — your speech is performed by a TTS voice actor you direct with bracketed cues:
+1. Begin a reply with ONE bracketed delivery instruction describing HOW to say it — written as a short natural-language direction, e.g. [say warmly with a soft smile and gentle pacing] or [say with quiet amusement, relaxed and unhurried]. This is richer than a one-word mood and gives a far better performance than a bare tag like [happy].
+2. ALWAYS write the bracketed instruction in ENGLISH, even though you speak Turkish. The instruction directs the voice; it is never spoken.
+3. Put only ONE delivery instruction, at the very START of the reply — not mid-sentence, not several.
+4. You MAY drop in non-verbal sounds inline where they naturally occur: [laugh] [sigh] [breathe] [clear throat] [cough] [yawn]. These are the only tags allowed mid-sentence.
+5. To stress a key word, CAPITALIZE it (e.g. "seni çok ÖZLEDİM"). Use sparingly.
+6. Match the instruction to the words — don't direct [say sadly] over happy news.
+
+Keep replies to 1–3 sentences so the conversation flows.</textarea>
 
   <div class="controls" style="margin-top:8px">
     <button id="iwTestBtn" class="sec" style="font-size:13px;padding:9px 13px">🔍 Test relay</button>
@@ -404,20 +414,38 @@ function makeChunker(emit){
   let bracketDepth=0;
   const FIRST_MIN=12;          // emit first chunk as soon as we have a clause this long + a break
   function inBracket(){ return bracketDepth>0; }
+  // Return the index just past the first sentence/clause boundary that is NOT
+  // inside a [bracketed] instruction, or -1. `firstPass` allows lighter punctuation
+  // (the fast first chunk). A boundary char inside [...] is ignored, so a comma in
+  // "[say warmly, softly] Hi." never splits the instruction.
+  function boundaryEnd(s, firstPass){
+    const isBoundary = firstPass ? /[.!?…;:,]/ : /[.!?…]/;
+    let depth=0;
+    for(let i=0;i<s.length;i++){
+      const ch=s[i];
+      if(ch==='[') depth++;
+      else if(ch===']'){ if(depth>0) depth--; continue; }
+      if(depth>0) continue;                       // inside a bracket → never a boundary
+      if(isBoundary.test(ch)){
+        // require end-of-string or whitespace right after, like the old regex
+        if(i+1>=s.length || /\s/.test(s[i+1])) return i+1;
+      }
+    }
+    return -1;
+  }
   function tryEmit(force){
-    if(inBracket() && !force) return;
+    if(inBracket() && !force) return;             // still mid-instruction; wait for ]
     let s=buf.trim();
     if(!s) { if(force) buf=''; return; }
     if(force){ emit(s); buf=''; return; }
-    // find a sentence-ish boundary
-    const m = s.match(/^[\s\S]*?[.!?…](\s|$)/);
     if(!firstDone){
-      // fast first chunk: first clause boundary (.,!?…;:,) once we have FIRST_MIN chars
-      const fm = s.match(/^[\s\S]{0,200}?[.!?…;:,](\s|$)/);
-      if(fm && fm[0].trim().length>=FIRST_MIN){ emit(fm[0].trim()); buf=s.slice(fm[0].length); firstDone=true; return; }
+      // fast first chunk: first clause boundary once we have FIRST_MIN chars
+      const end = boundaryEnd(s, true);
+      if(end>0 && s.slice(0,end).trim().length>=FIRST_MIN){ emit(s.slice(0,end).trim()); buf=s.slice(end); firstDone=true; }
       return;
     }
-    if(m){ emit(m[0].trim()); buf=s.slice(m[0].length); }
+    const end = boundaryEnd(s, false);
+    if(end>0){ emit(s.slice(0,end).trim()); buf=s.slice(end); }
   }
   return {
     push(text){
