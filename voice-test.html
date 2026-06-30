@@ -53,6 +53,12 @@
     <div>
       <label>LLM model (OpenRouter)</label>
       <input id="orModel" value="deepseek/deepseek-v4-pro">
+      <div class="hint">For a call, a fast model matters: try deepseek/deepseek-v4-flash if v4-pro lags.</div>
+    </div>
+    <div>
+      <label>Provider routing (speed)</label>
+      <input id="orSort" value="latency">
+      <div class="hint"><b>latency</b> = fastest first-word (best for calls) · throughput = fastest overall · blank = OpenRouter default (cheapest).</div>
     </div>
     <div>
       <label>Inworld voice id</label>
@@ -409,6 +415,7 @@ async function onUserTurn(userText){
   const model = $('orModel').value.trim();
   const sys = $('sysPrompt').value.trim();
   const messages = [{role:'system', content:sys}, ...history.slice(-12)];
+  const sortPref = ($('orSort').value||'').trim().toLowerCase();  // latency | throughput | ''
 
   const ctrl = new AbortController(); call.orAbort = ctrl;
   const t0 = performance.now(); let firstTok=0;
@@ -419,11 +426,20 @@ async function onUserTurn(userText){
   let acc = '';                 // full reply text
   const chunker = makeChunker(seg => { if(myTurn===call.turnSeq) ttsSend(seg); });
 
+  // request body — add OpenRouter provider routing to pick the FASTEST provider.
+  // sort:"latency" routes to the provider with the lowest time-to-first-token right
+  // now (5-min rolling window) — directly attacks the "OR first token 8892ms" lag.
+  const reqBody = { model, messages, stream:true, temperature:0.8, max_tokens:300,
+                    reasoning:{enabled:false,exclude:true} };
+  if(sortPref==='latency' || sortPref==='throughput'){
+    reqBody.provider = { sort: sortPref };
+  }
+
   try{
     const res = await fetch(OPENROUTER_URL, {
       method:'POST',
       headers:{'Authorization':'Bearer '+orKey,'Content-Type':'application/json','HTTP-Referer':'https://storymind.app','X-Title':'StoryMind-VoiceTest'},
-      body: JSON.stringify({ model, messages, stream:true, temperature:0.8, max_tokens:300, reasoning:{enabled:false,exclude:true} }),
+      body: JSON.stringify(reqBody),
       signal: ctrl.signal
     });
     if(!res.ok){ log('OR HTTP '+res.status, 'l-err'); const tx=await res.text().catch(()=>''); if(tx)log('OR body: '+tx.slice(0,300),'l-err'); cleanupGen(); return; }
