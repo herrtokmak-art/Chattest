@@ -61,10 +61,17 @@
   </div>
   <div class="row">
     <div>
+      <label>STT model (Deepgram)</label>
+      <input id="dgModel" value="nova-3">
+      <div class="hint"><b>nova-3</b> has Turkish (Jan 2026, big WER drop vs nova-2, esp. streaming). nova-2 = older fallback.</div>
+    </div>
+    <div>
       <label>STT language (BCP-47)</label>
       <input id="dgLang" value="tr">
       <div class="hint">tr = Turkish · en = English · or "multi"</div>
     </div>
+  </div>
+  <div class="row">
     <div>
       <label>Inworld TTS model</label>
       <input id="iwModel" value="inworld-tts-2">
@@ -263,7 +270,7 @@ function startDeepgram(){
   const uttEnd = parseInt($('dgUttEnd').value)||1200;
   // nova-3 is multilingual; fall back model param is fine. Use linear16 @16k mono.
   const params = new URLSearchParams({
-    model: 'nova-2', language: lang, encoding:'linear16', sample_rate:'16000', channels:'1',
+    model: ($('dgModel').value.trim()||'nova-3'), language: lang, encoding:'linear16', sample_rate:'16000', channels:'1',
     interim_results:'true', vad_events:'true', endpointing:String(endpoint), utterance_end_ms:String(uttEnd),
     smart_format:'true', punctuate:'true'
   });
