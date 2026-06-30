@@ -84,6 +84,18 @@
       <input id="iwLang" value="tr-TR">
       <div class="hint">Tells Inworld the target language. tr-TR = Turkish.</div>
     </div>
+    <div>
+      <label>Delivery mode</label>
+      <input id="iwDelivery" value="BALANCED">
+      <div class="hint">STABLE = flattest/tightest · BALANCED = natural · CREATIVE = dramatic (longer pauses). If pauses feel too long, use BALANCED or STABLE.</div>
+    </div>
+  </div>
+  <div class="row">
+    <div>
+      <label>Speaking rate (0.5–1.5)</label>
+      <input id="iwRate" value="1.1">
+      <div class="hint">1.0 = normal · raise toward 1.15–1.2 to tighten pauses and speed delivery.</div>
+    </div>
   </div>
 
   <label>Character instructions (the "call payload" — hardcoded for this test)</label>
@@ -96,6 +108,7 @@ VOICE DELIVERY (steering) — your speech is performed by a TTS voice actor you 
 4. You MAY drop in non-verbal sounds inline where they naturally occur: [laugh] [sigh] [breathe] [clear throat] [cough] [yawn]. These are the only tags allowed mid-sentence.
 5. To stress a key word, CAPITALIZE it (e.g. "seni çok ÖZLEDİM"). Use sparingly.
 6. Match the instruction to the words — don't direct [say sadly] over happy news.
+7. This is a fast, flowing phone call — keep delivery BRISK. Do NOT use pacing words that slow it down or add gaps: avoid "gentle pacing", "deliberate pauses", "drawn out", "slowly", "long sigh", "trailing off". Favor instructions about EMOTION and TONE (warm, amused, excited, teasing, concerned) rather than SPEED or PAUSES. Keep sentences short with minimal commas.
 
 Keep replies to 1–3 sentences so the conversation flows.</textarea>
 
@@ -573,13 +586,16 @@ async function synthOneHttp(text, turn){
   const voice = $('iwVoice').value.trim() || 'Dennis';
   const model = $('iwModel').value.trim() || 'inworld-tts-2';
   const lang  = ($('iwLang').value||'').trim();
+  const delivery = ($('iwDelivery').value||'BALANCED').trim().toUpperCase();
+  const rate  = parseFloat($('iwRate').value)||1.0;
   if(!u){ log('TTS synth: no relay URL', 'l-err'); return; }
   const body = {
     text,
     voiceId: voice,
     modelId: model,
-    audioConfig: { audioEncoding:'LINEAR16', sampleRateHertz:24000 },
-    deliveryMode: 'CREATIVE'    // inworld-tts-2: max emotional range for [bracket] tags
+    audioConfig: { audioEncoding:'LINEAR16', sampleRateHertz:24000,
+                   speakingRate: Math.max(0.5, Math.min(1.5, rate)) },
+    deliveryMode: delivery       // STABLE / BALANCED / CREATIVE — pacing & drama
   };
   if(lang) body.language = lang;   // BCP-47, e.g. tr-TR — improves Turkish pronunciation + normalization
   // share the barge-in AbortController so an interrupt kills in-flight synth too
